@@ -1,0 +1,158 @@
+#!/bin/python
+import requests
+from datetime import datetime
+from lxml import objectify
+import sys
+import config
+from db_config import get_db_connection, read_db_query, execute_db_query
+from zbx_monitor import *
+from logger_config import log_msg
+import os
+from os import path
+
+
+def get_status_api():
+    log_msg("Starting...")
+    if path.exists(zbx_trap_file):
+        os.system('rm ' + zbx_trap_file)
+    log_msg("starting get_status_api_check script.")
+    unreconciled_subs = get_unreconciled_records()
+    for sub in unreconciled_subs:
+        timestamp = datetime.now()
+        request_id = sub[0]
+        msisdn = sub[1]
+        ext_tid = generate_ext_tid(request_id, msisdn)
+        if not ext_tid:
+            log_msg("PASS: already reconciled subscriber {}, request_id {}".format(msisdn, request_id), "i")
+            counter['reconciled_subs'] += 1
+            continue
+        xml = config.BODY
+        xml = xml.format(timestamp=timestamp, msisdn=msisdn, ext_tid=ext_tid)
+        log_msg("check status with ext: {}, subscriber {}, request_id {}".format(ext_tid, msisdn, request_id))
+        url = config.EVD_ENDPOINT
+        log_msg("Request sent : " + xml, "d")
+        process_element = "{http://ws.adapter.imp.erefill.sixdee.com/}processRequestResponse"
+        try:
+            response = requests.post(url=url, data=xml, timeout=config.TIMEOUT)
+            status = response.status_code
+            log_msg("Received response : " + response.text, "i")
+            log_msg("Received status code : " + "[" + str(status) + "]", "i")
+            obj = objectify.fromstring(response.content)
+            process_request_response = obj.Body[process_element]
+            client_response = process_request_response["{}ClientResponse"]
+            result_code = client_response.ResultCode
+            response_message = client_response.ResponseMessage
+            if result_code == 0:
+                try:
+                    update_unreconciled_records(request_id, result_code, "null", timestamp, result_code,
+                                                ext_tid, "null", "null", "null")
+                    log_msg("DB update success : values request_id: {}, new_status_code: {}, ext: {}, "
+                            "subscriber {}".format(request_id, result_code, ext_tid, msisdn))
+                    counter['reconciled_subs'] += 1
+                except Exception as e:
+                    log_msg("DB update failure : values request_id: {}, new_status_code: {}, ext: {}, "
+                            "subscriber {}".format(request_id, result_code, ext_tid, msisdn), "e")
+                    log_msg("DB error :  {}".format(e), "e")
+                    counter['db_updates_error'] += 1
+                except AttributeError as e:
+                    log_msg("XML Parsing failed : missing ext_tid param element: <" + str(e) + ">", "e")
+                    counter['xml_missing_element_error'] += 1
+            elif result_code == 24:
+                try:
+                    update_unreconciled_records(request_id, result_code, response_message, timestamp, result_code,
+                                                ext_tid, "null", "null", "null")
+                    log_msg("DB update success : request_id: {}, new_status_code: {}, ext: {}, "
+                            "subscriber {}".format(request_id, result_code, ext_tid, msisdn))
+                    log_msg("response: {}, new_status_code: {}, ext: {}, subscriber: {}".format(response_message,
+                                                                                                result_code, ext_tid,
+                                                                                                msisdn
+                                                                                                ), "i")
+                    counter['reconciled_subs'] += 1
+                except Exception as e:
+                    log_msg("DB update failure : values request_id: {}, new_status_code: {}, ext: {}, "
+                            "subscriber {}".format(request_id, result_code, ext_tid, msisdn), "e")
+                    log_msg("DB error :  {}".format(e), "e")
+                    counter['db_updates_error'] += 1
+            else:
+                try:
+                    update_unreconciled_records(request_id, result_code, response_message, timestamp, result_code,
+                                                ext_tid, "null", "null", "null")
+                    log_msg("DB update success : request_id: {}, new_status_code: {}, ext: {}, "
+                            "subscriber {}".format(request_id, result_code, ext_tid, msisdn))
+                    log_msg("response: {}, new_status_code: {}, ext: {}, subscriber: {}".format(response_message,
+                                                                                                result_code, ext_tid,
+                                                                                                msisdn
+                                                                                                ), "i")
+                    counter['unknown_status_success'] += 1
+                except Exception as e:
+                    log_msg("DB update failure : values request_id: {}, new_status_code: {}, ext: {}, "
+                            "subscriber {}".format(request_id, result_code, ext_tid, msisdn), "e")
+                    log_msg("DB error :  {}".format(e), "e")
+                    counter['unknown_status_error'] += 1
+        except requests.exceptions.Timeout as e:
+            log_msg("evd-call failed to get response " + str(e), "e")
+            counter['call_timeout_error'] += 1
+
+        # Add monitoring
+        add_zbx_data(hostname, "db.updates.error", str(counter['db_updates_error']))
+        add_zbx_data(hostname, "db.success.updates", str(counter['db_updates_success']))
+        add_zbx_data(hostname, "call.url.timeout.error", str(counter['call_timeout_error']))
+        add_zbx_data(hostname, "count.unreconciled.subs", str(counter['unreconciled_subs']))
+        add_zbx_data(hostname, "count.reconciled.subs", str(counter['reconciled_subs']))
+        add_zbx_data(hostname, "count.unknownresponsecode.error", str(counter['unknown_status_error']))
+        add_zbx_data(hostname, "count.unknownresponsecode.success", str(counter['unknown_status_success']))
+        update_monitoring()
+
+
+def get_unreconciled_records():
+    count_sql = '''select count(*) from tbl_vtop_credit_req_new where request_status = '-1';'''
+    conn = get_db_connection()
+    if conn is not None:
+        count = read_db_query(conn, count_sql)
+        log_msg("count of unreconciled subscribers : " + str(count[0][0]))
+        counter['unreconciled_subs'] = str(count[0][0])
+        if count[0][0] > 0:
+            details_sql = '''select request_fk, subscriber_fk from tbl_vtop_credit_req_new where request_status = '-1' order by 1 asc limit 50;
+            '''
+            subs = read_db_query(conn, details_sql)
+            log_msg("unreconciled subscriber list : " + str(subs))
+            return subs
+        else:
+            log_msg("Nothing to do. " + str(count[0][0]) + " subscriber(s) found with status '-1'", "i")
+            sys.exit(1)
+
+
+def update_unreconciled_records(request, new_status, error, time_processed, response, ext_tid, balance_after,
+                                ma_balance, recovered):
+    sql = '''select * from proc_update_vtop_req_status({request}, {new_status}::smallint, '{error}'::text, '{time_processed}'::timestamp, 
+    {response}::text, {ext_tid}::text, {balance_after}::typ_money_unit, {ma_balance}::integer, {recovered}::integer);'''
+    sql = sql.format(request=request, new_status=new_status, error=error, time_processed=time_processed,
+                     response=response, ext_tid=ext_tid, balance_after=balance_after, ma_balance=ma_balance,
+                     recovered=recovered)
+    conn = get_db_connection()
+    try:
+        results = execute_db_query(conn, sql)
+        log_msg(results, "d")
+        return True
+    except Exception as e:
+        raise Exception('DB update failure : {}'.format(e))
+
+
+def generate_ext_tid(request, msisdn):
+    sql = '''SELECT CASE WHEN loan_type = 'airtime' then concat('9XXXXXXXX', LPAD(request_amount::text, 7, '0'), 1, 
+            substring(CAST(request_fk as text), 1, 15), '000', 1) ELSE concat('9XXXXXXXX', LPAD(request_amount::text, 7, '0'), 2, 
+            substring(CAST(request_fk as text), 1, 15), '000', 1) END AS external_txnid FROM tbl_vtop_credit_req_new WHERE request_fk = 
+            {request} and subscriber_fk = '{msisdn}';'''
+    sql = sql.format(request=request, msisdn=msisdn)
+    try:
+        conn = get_db_connection()
+        ext_sql_rs = read_db_query(conn, sql)
+        if len(ext_sql_rs) > 0:
+            ext_tid = ext_sql_rs[0][0]
+            return ext_tid
+    except Exception as e:
+        raise Exception('Error received from underlined database: {}'.format(e))
+
+
+get_status_api()
+
